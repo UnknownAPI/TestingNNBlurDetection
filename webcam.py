@@ -1,79 +1,122 @@
 import sys
+
+import numpy as np
+from PySide6.QtWidgets import QApplication, QLabel, QWidget, QVBoxLayout
+from PySide6.QtGui import QImage, QPixmap, QFont
+from PySide6.QtCore import QTimer
+import torch
+import torch.nn as nn
 import cv2
-from PySide6.QtWidgets import (
-    QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QPushButton,
-    QLabel,
-)
-from PySide6.QtGui import QImage, QPixmap
+import torch.amp
+from torchvision import transforms
+from PIL import Image
+transform = transforms.Compose([
+    transforms.Resize((128, 128)),  # 🔥 CRITICAL
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5], std=[0.5])
+])
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+sigma_range=(0,
+             30)
+sigma_mean = (sigma_range[1] - sigma_range[0]) / 2
+sigma_std = (sigma_range[1] - sigma_range[0]) / 2
+class BlurRegressionCNN(nn.Module):
+    def __init__(self):
+        super(BlurRegressionCNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(16),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(32),
+            nn.MaxPool2d(32),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(64),
+            nn.MaxPool2d(2),
+        )
+        self.regressor = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 1),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.regressor(x)
+        return x.squeeze(-1)
 
 
-class WebcamWindow(QMainWindow):
+class WebcamViewer(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Webcam Feed")
-        self.setGeometry(100, 100, 640, 480)
+        self.setWindowTitle("Live Webcam Feed with Sharpness Score")
 
-        # Create main widget and layout
-        self.central_widget = QWidget()
-        self.setCentralWidget(self.central_widget)
-        self.layout = QVBoxLayout(self.central_widget)
+        # UI elements
+        self.image_label = QLabel()
+        self.sharpness_label = QLabel("Sharpness: ")
+        self.sharpness_label.setFont(QFont("Arial", 14))
 
-        # Create label to display video
-        self.video_label = QLabel(self)
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.layout.addWidget(self.video_label)
+        layout = QVBoxLayout()
+        layout.addWidget(self.image_label)
+        layout.addWidget(self.sharpness_label)
+        self.setLayout(layout)
 
-        # Create stop button
-        self.stop_button = QPushButton("Stop", self)
-        self.stop_button.clicked.connect(self.close)
-        self.layout.addWidget(self.stop_button)
+        # Video capture
+        self.cap = cv2.VideoCapture(0)
+        self.model = BlurRegressionCNN().to(device)
+        self.model.load_state_dict(torch.load("best_blur_model.pth", map_location=device))
+        self.model.eval()
 
-        # Initialize webcam
-        self.capture = cv2.VideoCapture(0)  # 0 is usually the default webcam
-        if not self.capture.isOpened():
-            print("Error: Could not open webcam")
-            sys.exit()
-
-        # Set up timer for updating video feed
+        # Timer
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
-        self.timer.start(30)  # Update every ~30ms (~33fps)
+        self.timer.start(30)
+
+    def preprocess_frame(self, frame):
+        # Convert to grayscale
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Resize to expected input size (e.g., 240x320)
+        resized = cv2.resize(gray, (320, 240))
+        # Normalize to [0, 1]
+        normalized = resized.astype(np.float32) / 255.0
+        # Add batch and channel dimensions: (1, 1, H, W)
+        tensor = torch.from_numpy(normalized).unsqueeze(0).unsqueeze(0).to(device)
+        return tensor
 
     def update_frame(self):
-        ret, frame = self.capture.read()
+        ret, frame = self.cap.read()
         if ret:
-            # Convert OpenCV BGR image to RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-            # Convert to QImage
-            h, w, ch = frame_rgb.shape
+            # Convert BGR (OpenCV) to RGB (Qt)
+            rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
-            image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            self.image_label.setPixmap(QPixmap.fromImage(qt_image))
 
-            # Scale image to fit label while maintaining aspect ratio
-            pixmap = QPixmap.fromImage(image)
-            scaled_pixmap = pixmap.scaled(
-                self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
+            # Convert to PIL, grayscale
+            img_pil = Image.fromarray(frame).convert("L")
 
-            # Display image
-            self.video_label.setPixmap(scaled_pixmap)
+            # Apply transform
+            input_tensor = transform(img_pil).unsqueeze(0).to(device)
+            with torch.no_grad():
+                sharpness_score = self.model(input_tensor).item()
+                denormalized = sharpness_score * sigma_std + sigma_mean
+
+            # Update label
+            self.sharpness_label.setText(f"Sharpness: {denormalized:.2f}")
 
     def closeEvent(self, event):
-        # Release webcam when closing
-        self.capture.release()
-        event.accept()
+        self.cap.release()
 
 
-def main():
+if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = WebcamWindow()
-    window.show()
+    viewer = WebcamViewer()
+    viewer.show()
     sys.exit(app.exec())
-
-if __name__ == '__main__':
-    main()
